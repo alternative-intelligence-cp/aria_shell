@@ -172,6 +172,14 @@ public:
     void onData(DataCallback callback);
     
     /**
+     * Flush stream buffers and invoke callbacks
+     * 
+     * Drains all pending data from ring buffers and calls registered callbacks.
+     * Useful after process exits to get remaining output.
+     */
+    void flushBuffers();
+    
+    /**
      * Register callback for process exit
      */
     void onExit(ExitCallback callback);

@@ -127,28 +127,34 @@ std::unique_ptr<StmtNode> ShellParser::parseStatement() {
         return parseAssignment(varName);
     }
     
-    // 4. Expression statement (single identifier or expression to evaluate)
-    if (check(TokenType::IDENTIFIER) || check(TokenType::INTEGER) || check(TokenType::LPAREN)) {
-        // Check if this looks like a command (identifier followed by more identifiers/args)
-        // vs an expression (identifier alone, or with operators)
-        if (check(TokenType::IDENTIFIER)) {
-            // Peek ahead: if next is an operator or EOF/semicolon, it's an expression
-            TokenType next = peek(1).type;
-            if (next == TokenType::SEMICOLON || next == TokenType::END_OF_FILE ||
-                next == TokenType::PLUS || next == TokenType::MINUS ||
-                next == TokenType::STAR || next == TokenType::SLASH ||
-                next == TokenType::EQ || next == TokenType::NE ||
-                next == TokenType::LT || next == TokenType::GT ||
-                next == TokenType::LPAREN) {  // Function call
-                // Expression statement
-                auto expr = parseExpression();
-                match(TokenType::SEMICOLON);
-                return std::make_unique<ExprStmt>(std::move(expr), expr->location);
-            }
+    // 4. Expression statement (arithmetic/logical expressions to evaluate)
+    // Only treat as expression if there are OPERATORS present
+    if (check(TokenType::INTEGER) || check(TokenType::LPAREN)) {
+        auto expr = parseExpression();
+        match(TokenType::SEMICOLON);
+        return std::make_unique<ExprStmt>(std::move(expr), expr->location);
+    }
+    
+    if (check(TokenType::IDENTIFIER)) {
+        // Peek ahead to check if this is an expression with operators
+        TokenType next = peek(1).type;
+        
+        // If followed by arithmetic/logical operator, it's an expression
+        if (next == TokenType::PLUS || next == TokenType::MINUS ||
+            next == TokenType::STAR || next == TokenType::SLASH ||
+            next == TokenType::EQ || next == TokenType::NE ||
+            next == TokenType::LT || next == TokenType::GT ||
+            next == TokenType::LE || next == TokenType::GE ||
+            next == TokenType::AND || next == TokenType::OR ||
+            next == TokenType::LPAREN) {  // Function call
+            // Expression statement
+            auto expr = parseExpression();
+            match(TokenType::SEMICOLON);
+            return std::make_unique<ExprStmt>(std::move(expr), expr->location);
         }
     }
     
-    // 5. Pipeline (command mode)
+    // 5. Default: Treat as command/pipeline
     return parsePipeline();
 }
 

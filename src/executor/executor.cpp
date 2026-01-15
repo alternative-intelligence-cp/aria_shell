@@ -8,9 +8,57 @@
 #include <sstream>
 #include <thread>
 #include <chrono>
+#include <cstdlib>
+#include <unistd.h>
+#include <sys/stat.h>
 
 namespace ariash {
 namespace executor {
+
+// =============================================================================
+// Path Resolution
+// =============================================================================
+
+static std::string resolveExecutablePath(const std::string& command) {
+    // If command contains a slash, it's a path - use as-is
+    if (command.find('/') != std::string::npos) {
+        return command;
+    }
+    
+    // Search PATH
+    const char* pathEnv = std::getenv("PATH");
+    if (!pathEnv) {
+        return command;  // No PATH, try command as-is
+    }
+    
+    std::string path(pathEnv);
+    size_t start = 0;
+    size_t end;
+    
+    while ((end = path.find(':', start)) != std::string::npos) {
+        std::string dir = path.substr(start, end - start);
+        std::string fullPath = dir + "/" + command;
+        
+        // Check if file exists and is executable
+        struct stat st;
+        if (stat(fullPath.c_str(), &st) == 0 && (st.st_mode & S_IXUSR)) {
+            return fullPath;
+        }
+        
+        start = end + 1;
+    }
+    
+    // Check last directory
+    std::string dir = path.substr(start);
+    std::string fullPath = dir + "/" + command;
+    struct stat st;
+    if (stat(fullPath.c_str(), &st) == 0 && (st.st_mode & S_IXUSR)) {
+        return fullPath;
+    }
+    
+    // Not found in PATH, return original command
+    return command;
+}
 
 // =============================================================================
 // Value Utilities
@@ -359,7 +407,9 @@ void Executor::executeCommand(parser::CommandStmt& cmd) {
     using namespace job;
     
     ProcessConfig config;
-    config.executable = cmd.executable;
+    
+    // Resolve executable path from PATH
+    config.executable = resolveExecutablePath(cmd.executable);
     config.arguments = cmd.arguments;
     config.foregroundMode = false;  // Capture output via callbacks
     
@@ -398,8 +448,11 @@ void Executor::executeCommand(parser::CommandStmt& cmd) {
         // Foreground execution - wait for completion
         int exitCode = process.wait();
         
-        // Give drainers a moment to flush remaining output
+        // Give drainers a moment to finish reading
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        
+        // Flush buffers and invoke callbacks with remaining data
+        process.flushBuffers();
         
         // Store exit code as last result
         lastResult_ = static_cast<int64_t>(exitCode);

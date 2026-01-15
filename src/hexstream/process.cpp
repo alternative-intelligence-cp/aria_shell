@@ -294,6 +294,10 @@ void HexStreamProcess::onData(DataCallback callback) {
     streamController_.onData(callback);
 }
 
+void HexStreamProcess::flushBuffers() {
+    streamController_.flushBuffers();
+}
+
 void HexStreamProcess::onExit(ExitCallback callback) {
     exitCallback_ = callback;
 }
