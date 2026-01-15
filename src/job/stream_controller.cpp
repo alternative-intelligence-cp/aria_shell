@@ -4,6 +4,7 @@
  * ARIA-021: Shell Job Control State Machine Design
  *
  * Implements the Threaded Draining Model for deadlock-free I/O.
+ * Uses C++20 std::jthread with cooperative interruption for safe thread lifecycle.
  */
 
 #include "job/stream_controller.hpp"
@@ -15,7 +16,7 @@
 #else
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/select.h>
+#include <poll.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
@@ -163,13 +164,106 @@ bool HexStreamPipes::isValid() const {
 }
 
 // =============================================================================
+// Stream Drainer Implementation (C++20 jthread)
+// =============================================================================
+
+StreamDrainer::StreamDrainer(StreamIndex stream, int fd, RingBuffer* buffer, bool dropOnOverflow)
+    : stream_(stream), fd_(fd), buffer_(buffer), dropOnOverflow_(dropOnOverflow)
+{
+    // Start worker thread immediately
+    worker_ = std::jthread([this](std::stop_token stoken) {
+        drainLoop(stoken);
+    });
+}
+
+void StreamDrainer::drainLoop(std::stop_token stoken) {
+    active_.store(true, std::memory_order_release);
+    
+    std::vector<uint8_t> readBuffer(4096);  // 4KB local buffer
+
+    while (!stoken.stop_requested()) {
+        struct pollfd pfd;
+        pfd.fd = fd_;
+        pfd.events = POLLIN;
+
+        // Wait up to 100ms for data (allows checking stop_token periodically)
+        int ret = poll(&pfd, 1, 100);
+
+        if (ret < 0) {
+            if (errno == EINTR) continue;  // Signal interruption, retry
+            break;  // Fatal error
+        }
+
+        if (ret == 0) {
+            // Timeout: loop back to check stop_requested()
+            continue;
+        }
+
+        // Data available
+        if (pfd.revents & POLLIN) {
+            ssize_t n = read(fd_, readBuffer.data(), readBuffer.size());
+            
+            if (n > 0) {
+                // Successful read
+                size_t written = buffer_->write(readBuffer.data(), n);
+                
+                if (written < static_cast<size_t>(n)) {
+                    // Buffer full - apply overflow policy
+                    if (dropOnOverflow_) {
+                        // DROP MODE: Discard excess data (acceptable for telemetry)
+                        // Already written what we could, drop the rest
+                    } else {
+                        // BLOCK MODE: Apply backpressure
+                        size_t remaining = n - written;
+                        const uint8_t* remainingData = readBuffer.data() + written;
+                        
+                        while (remaining > 0 && !stoken.stop_requested()) {
+                            size_t chunk = buffer_->write(remainingData, remaining);
+                            if (chunk == 0) {
+                                // Still full, yield to consumer
+                                std::this_thread::yield();
+                            } else {
+                                remainingData += chunk;
+                                remaining -= chunk;
+                            }
+                        }
+                    }
+                }
+                
+                bytesTransferred_.fetch_add(n, std::memory_order_relaxed);
+            } else if (n == 0) {
+                // EOF: Child closed the pipe (normal exit)
+                break;
+            } else {
+                // Error handling
+                if (errno != EAGAIN && errno != EINTR) {
+                    break;
+                }
+            }
+        }
+        
+        if (pfd.revents & (POLLHUP | POLLERR)) {
+            // Pipe closed or error
+            break;
+        }
+    }
+    
+    active_.store(false, std::memory_order_release);
+}
+
+// =============================================================================
 // Stream Controller Implementation
 // =============================================================================
 
 StreamController::StreamController() {
-    // Create ring buffers for output streams
+    // Create ring buffers for output streams (1MB each for high throughput)
     for (int i = 0; i < static_cast<int>(StreamIndex::COUNT); ++i) {
-        buffers[i] = std::make_unique<RingBuffer>(64 * 1024);
+        buffers[i] = std::make_unique<RingBuffer>(1024 * 1024);
+    }
+    
+    // Initialize drainers to nullptr
+    for (int i = 0; i < 4; ++i) {
+        drainers[i] = nullptr;
     }
 }
 
@@ -219,23 +313,23 @@ bool StreamController::createPipes() {
 bool StreamController::setupChild() {
 #ifndef _WIN32
     // Redirect FDs 0-5 to pipes
-    // stdin: read from parent's write end
+    // stdin (stream 0): read from parent's write end (pipes.fds[1])
     if (dup2(pipes.fds[1], STDIN_FILENO) < 0) return false;
 
-    // stdout: write to parent's read end
-    if (dup2(pipes.fds[2], STDOUT_FILENO) < 0) return false;
+    // stdout (stream 1): write to parent's read end (pipes.fds[3] is write end)
+    if (dup2(pipes.fds[3], STDOUT_FILENO) < 0) return false;
 
-    // stderr: write to parent's read end
-    if (dup2(pipes.fds[4], STDERR_FILENO) < 0) return false;
+    // stderr (stream 2): write to parent's read end (pipes.fds[5] is write end)
+    if (dup2(pipes.fds[5], STDERR_FILENO) < 0) return false;
 
-    // stddbg (FD 3): write to parent's read end
-    if (dup2(pipes.fds[6], 3) < 0) return false;
+    // stddbg (stream 3, FD 3): write to parent's read end (pipes.fds[7] is write end)
+    if (dup2(pipes.fds[7], 3) < 0) return false;
 
-    // stddati (FD 4): read from parent's write end
+    // stddati (stream 4, FD 4): read from parent's write end (pipes.fds[9])
     if (dup2(pipes.fds[9], 4) < 0) return false;
 
-    // stddato (FD 5): write to parent's read end
-    if (dup2(pipes.fds[10], 5) < 0) return false;
+    // stddato (stream 5, FD 5): write to parent's read end (pipes.fds[11] is write end)
+    if (dup2(pipes.fds[11], 5) < 0) return false;
 
     // Close all original pipe FDs
     for (int i = 0; i < 12; ++i) {
@@ -279,32 +373,39 @@ bool StreamController::setupParent() {
 }
 
 bool StreamController::startDraining() {
-    stopFlag.store(false);
-
 #ifndef _WIN32
-    // Start drain threads for output streams
-    // stdout (fd index 2)
+    // Start C++20 jthread drainers for output streams
+    
+    // stdout (fd index 2) - block on overflow (user output is critical)
     if (pipes.fds[2] >= 0) {
-        drainThreads[0] = std::thread(&StreamController::drainLoop, this,
-                                       StreamIndex::STDOUT, pipes.fds[2]);
+        drainers[0] = std::make_unique<StreamDrainer>(StreamIndex::STDOUT,
+                                                       pipes.fds[2], 
+                                                       buffers[static_cast<int>(StreamIndex::STDOUT)].get(),
+                                                       false);  // block on overflow
     }
 
-    // stderr (fd index 4)
+    // stderr (fd index 4) - block on overflow (errors are critical)
     if (pipes.fds[4] >= 0) {
-        drainThreads[1] = std::thread(&StreamController::drainLoop, this,
-                                       StreamIndex::STDERR, pipes.fds[4]);
+        drainers[1] = std::make_unique<StreamDrainer>(StreamIndex::STDERR,
+                                                       pipes.fds[4],
+                                                       buffers[static_cast<int>(StreamIndex::STDERR)].get(),
+                                                       false);  // block on overflow
     }
 
-    // stddbg (fd index 6)
+    // stddbg (fd index 6) - drop on overflow (telemetry should never block)
     if (pipes.fds[6] >= 0) {
-        drainThreads[2] = std::thread(&StreamController::drainLoop, this,
-                                       StreamIndex::STDDBG, pipes.fds[6]);
+        drainers[2] = std::make_unique<StreamDrainer>(StreamIndex::STDDBG,
+                                                       pipes.fds[6],
+                                                       buffers[static_cast<int>(StreamIndex::STDDBG)].get(),
+                                                       true);  // drop on overflow
     }
 
-    // stddato (fd index 10)
+    // stddato (fd index 10) - block on overflow (binary data is critical)
     if (pipes.fds[10] >= 0) {
-        drainThreads[3] = std::thread(&StreamController::drainLoop, this,
-                                       StreamIndex::STDDATO, pipes.fds[10]);
+        drainers[3] = std::make_unique<StreamDrainer>(StreamIndex::STDDATO,
+                                                       pipes.fds[10],
+                                                       buffers[static_cast<int>(StreamIndex::STDDATO)].get(),
+                                                       false);  // block on overflow
     }
 #endif
 
@@ -312,59 +413,10 @@ bool StreamController::startDraining() {
 }
 
 void StreamController::stopDraining() {
-    stopFlag.store(true);
-
-    // Wait for threads to finish
+    // C++20 jthread auto-stops and joins on destruction
     for (int i = 0; i < 4; ++i) {
-        if (drainThreads[i].joinable()) {
-            drainThreads[i].join();
-        }
+        drainers[i].reset();  // Triggers jthread destructor -> request_stop() + join()
     }
-}
-
-void StreamController::drainLoop(StreamIndex stream, int fd) {
-#ifndef _WIN32
-    uint8_t buf[4096];
-
-    while (!stopFlag.load()) {
-        // Use select with timeout for cancellation
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(fd, &readfds);
-
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000;  // 100ms
-
-        int ret = select(fd + 1, &readfds, nullptr, nullptr, &tv);
-        if (ret < 0) {
-            break;  // Error
-        }
-        if (ret == 0) {
-            continue;  // Timeout, check stop flag
-        }
-
-        ssize_t n = read(fd, buf, sizeof(buf));
-        if (n <= 0) {
-            break;  // EOF or error
-        }
-
-        // In foreground mode, write directly to TTY for stdout/stderr
-        if (foregroundMode.load() &&
-            (stream == StreamIndex::STDOUT || stream == StreamIndex::STDERR)) {
-            int ttyFd = (stream == StreamIndex::STDOUT) ? STDOUT_FILENO : STDERR_FILENO;
-            ssize_t written = ::write(ttyFd, buf, n);
-            (void)written;  // Ignore return value in foreground passthrough
-        }
-
-        // Always buffer the data
-        int idx = static_cast<int>(stream);
-        buffers[idx]->write(buf, n);
-
-        // Notify callbacks
-        notifyData(stream, buf, n);
-    }
-#endif
 }
 
 ssize_t StreamController::writeStdin(const void* data, size_t size) {
@@ -426,6 +478,64 @@ void StreamController::close() {
     stopDraining();
     pipes.close();
 }
+
+size_t StreamController::getTotalBytesTransferred() const {
+    size_t total = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (drainers[i]) {
+            total += drainers[i]->bytesTransferred();
+        }
+    }
+    return total;
+}
+
+size_t StreamController::getActiveThreadCount() const {
+    size_t count = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (drainers[i] && drainers[i]->isActive()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+#ifdef __linux__
+// Zero-copy splice optimization for Linux
+ssize_t StreamController::splicePipeToPipe(int fdIn, int fdOut, std::stop_token stoken) {
+    ssize_t totalBytes = 0;
+    
+    while (!stoken.stop_requested()) {
+        // Attempt to move up to 1MB (splice works in kernel space)
+        // SPLICE_F_MOVE: Hint to kernel to move pages instead of copying
+        // SPLICE_F_NONBLOCK: Don't hang if pipe is full/empty
+        ssize_t ret = splice(fdIn, nullptr, fdOut, nullptr, 1048576,
+                            SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE);
+
+        if (ret > 0) {
+            totalBytes += ret;
+        } else if (ret == 0) {
+            // EOF
+            break;
+        } else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Pipe is empty (read) or full (write)
+                // Wait for readiness using poll()
+                struct pollfd pfds[2];
+                pfds[0].fd = fdIn;   pfds[0].events = POLLIN;
+                pfds[1].fd = fdOut;  pfds[1].events = POLLOUT;
+                
+                poll(pfds, 2, 100);  // 100ms timeout for stop_token check
+                continue;
+            }
+            if (errno == EINTR) continue;
+            // Fatal error
+            break;
+        }
+    }
+    
+    return totalBytes;
+}
+#endif
 
 } // namespace job
 } // namespace ariash

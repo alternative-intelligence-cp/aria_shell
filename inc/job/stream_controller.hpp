@@ -104,8 +104,11 @@ public:
 
 private:
     std::vector<uint8_t> buffer;
-    std::atomic<size_t> readPos{0};
-    std::atomic<size_t> writePos{0};
+    
+    // Cache-line aligned atomics to prevent false sharing
+    alignas(64) std::atomic<size_t> readPos{0};
+    alignas(64) std::atomic<size_t> writePos{0};
+    
     size_t capacity;
 };
 
@@ -134,6 +137,33 @@ struct HexStreamPipes {
     HexStreamPipes();
     void close();
     bool isValid() const;
+};
+
+/**
+ * Stream Drainer Worker
+ *
+ * C++20 jthread-based worker that continuously drains a single FD.
+ */
+class StreamDrainer {
+public:
+    StreamDrainer(StreamIndex stream, int fd, RingBuffer* buffer, bool dropOnOverflow);
+    ~StreamDrainer() = default;  // jthread joins automatically
+
+    // Statistics
+    size_t bytesTransferred() const { return bytesTransferred_.load(); }
+    bool isActive() const { return active_.load(); }
+    StreamIndex getStream() const { return stream_; }
+
+private:
+    void drainLoop(std::stop_token stoken);
+
+    std::jthread worker_;
+    StreamIndex stream_;
+    int fd_;
+    RingBuffer* buffer_;
+    bool dropOnOverflow_;
+    std::atomic<size_t> bytesTransferred_{0};
+    std::atomic<bool> active_{false};
 };
 
 /**
@@ -242,15 +272,20 @@ public:
      */
     void close();
 
+    /**
+     * Get performance statistics
+     */
+    size_t getTotalBytesTransferred() const;
+    size_t getActiveThreadCount() const;
+
 private:
     HexStreamPipes pipes;
 
-    // Ring buffers for each output stream
+    // Ring buffers for each output stream (1MB each for high throughput)
     std::unique_ptr<RingBuffer> buffers[static_cast<int>(StreamIndex::COUNT)];
 
-    // Drain threads
-    std::thread drainThreads[4];  // stdout, stderr, stddbg, stddato
-    std::atomic<bool> stopFlag{false};
+    // C++20 jthread-based drainers (auto-join on destruction)
+    std::unique_ptr<StreamDrainer> drainers[4];  // stdout, stderr, stddbg, stddato
 
     // Callbacks
     std::vector<StreamCallback> callbacks;
@@ -259,14 +294,12 @@ private:
     // Mode
     std::atomic<bool> foregroundMode{true};
 
-    // Thread functions
-    void drainLoop(StreamIndex stream, int fd);
+    // Helper functions
     void notifyData(StreamIndex stream, const void* data, size_t size);
 
 #ifdef __linux__
     // Zero-copy optimization using splice()
-    bool useSplice = false;
-    void spliceLoop(int srcFd, int dstFd);
+    ssize_t splicePipeToPipe(int fdIn, int fdOut, std::stop_token stoken);
 #endif
 };
 
