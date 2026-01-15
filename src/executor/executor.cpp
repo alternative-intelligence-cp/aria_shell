@@ -6,6 +6,8 @@
 #include <iostream>
 #include <stdexcept>
 #include <sstream>
+#include <thread>
+#include <chrono>
 
 namespace ariash {
 namespace executor {
@@ -353,22 +355,51 @@ void Executor::visit(parser::Program& node) {
 // =============================================================================
 
 void Executor::executeCommand(parser::CommandStmt& cmd) {
-    hexstream::ProcessConfig config;
+    using namespace hexstream;
+    using namespace job;
+    
+    ProcessConfig config;
     config.executable = cmd.executable;
-    config.arguments = cmd.arguments;  // Direct assignment
+    config.arguments = cmd.arguments;
+    config.foregroundMode = false;  // Capture output via callbacks
     
     // Setup redirections
     setupRedirections(cmd.redirections, config);
     
-    // Create and execute process
-    hexstream::HexStreamProcess process(config);
+    // Create process
+    HexStreamProcess process(config);
+    
+    // Register callback to display output in real-time
+    process.onData([](StreamIndex stream, const void* data, size_t size) {
+        if (stream == StreamIndex::STDOUT) {
+            // Write stdout directly to terminal
+            std::cout.write(static_cast<const char*>(data), size);
+            std::cout.flush();
+        } else if (stream == StreamIndex::STDERR) {
+            // Write stderr directly to terminal
+            std::cerr.write(static_cast<const char*>(data), size);
+            std::cerr.flush();
+        }
+        // Could also handle STDDBG for debug output
+    });
+    
+    // Spawn the process
+    if (!process.spawn()) {
+        std::cerr << "Failed to spawn process: " << cmd.executable << std::endl;
+        lastResult_ = static_cast<int64_t>(-1);
+        return;
+    }
     
     if (cmd.background) {
         // Background execution - don't wait
-        std::cout << "[Background] Started " << cmd.executable << std::endl;
+        std::cout << "[Background] Started PID " << process.getPid() << std::endl;
+        lastResult_ = static_cast<int64_t>(0);
     } else {
         // Foreground execution - wait for completion
         int exitCode = process.wait();
+        
+        // Give drainers a moment to flush remaining output
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         
         // Store exit code as last result
         lastResult_ = static_cast<int64_t>(exitCode);
