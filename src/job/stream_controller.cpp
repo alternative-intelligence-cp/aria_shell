@@ -431,6 +431,20 @@ ssize_t StreamController::writeStdin(const void* data, size_t size) {
 #endif
 }
 
+void StreamController::closeStdin() {
+#ifdef _WIN32
+    if (pipes.handles[1] != INVALID_HANDLE_VALUE) {
+        CloseHandle(pipes.handles[1]);
+        pipes.handles[1] = INVALID_HANDLE_VALUE;
+    }
+#else
+    if (pipes.fds[1] >= 0) {
+        ::close(pipes.fds[1]);
+        pipes.fds[1] = -1;
+    }
+#endif
+}
+
 size_t StreamController::readBuffer(StreamIndex stream, void* data, size_t maxSize) {
     int idx = static_cast<int>(stream);
     return buffers[idx]->read(data, maxSize);

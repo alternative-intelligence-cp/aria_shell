@@ -226,6 +226,14 @@ public:
     ssize_t writeStdin(const void* data, size_t size);
 
     /**
+     * Close stdin pipe (signals EOF to child process)
+     *
+     * Call this when done sending input to a process that reads from stdin.
+     * Programs like cat, grep, sort wait for EOF before producing output.
+     */
+    void closeStdin();
+
+    /**
      * Read from output buffer
      *
      * @param stream Which stream to read
